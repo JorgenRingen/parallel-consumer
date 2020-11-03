@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static io.confluent.parallelconsumer.ParallelEoSStreamProcessor.State.*;
 import static io.confluent.csid.utils.BackportUtils.isEmpty;
@@ -115,6 +116,11 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
      * Wrapped {@link ConsumerRebalanceListener} passed in by a user that we can also call on events
      */
     private Optional<ConsumerRebalanceListener> usersConsumerRebalanceListener = Optional.empty();
+
+    /**
+     * The number of messages to attempt pass into the {@link #pollBatch} user function
+     */
+    private int batchLevel = 5;
 
     /**
      * Construct the AsyncConsumer by wrapping this passed in conusmer and producer, which can be configured any which
@@ -253,7 +259,11 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
 
     @Override
     public void poll(Consumer<ConsumerRecord<K, V>> usersVoidConsumptionFunction) {
-        Function<ConsumerRecord<K, V>, List<Object>> wrappedUserFunc = (record) -> {
+        Function<List<ConsumerRecord<K, V>>, List<Object>> wrappedUserFunc = (recordList) -> {
+            if (recordList.size() != 1) {
+                throw new IllegalArgumentException("Bug: Function only takes a single element");
+            }
+            var record = recordList.get(0); // will always only have one
             log.trace("asyncPoll - Consumed a record ({}), executing void function...", record.offset());
             usersVoidConsumptionFunction.accept(record);
             return UniLists.of(); // user function returns no produce records, so we satisfy our api
@@ -267,7 +277,8 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
     public void pollAndProduce(Function<ConsumerRecord<K, V>, List<ProducerRecord<K, V>>> userFunction,
                                Consumer<ConsumeProduceResult<K, V, K, V>> callback) {
         // wrap user func to add produce function
-        Function<ConsumerRecord<K, V>, List<ConsumeProduceResult<K, V, K, V>>> wrappedUserFunc = (consumedRecord) -> {
+        Function<List<ConsumerRecord<K, V>>, List<ConsumeProduceResult<K, V, K, V>>> wrappedUserFunc = (consumedRecordList) -> {
+            var consumedRecord = consumedRecordList.get(0); // will always only have one
             List<ProducerRecord<K, V>> recordListToProduce = userFunction.apply(consumedRecord);
             if (recordListToProduce.isEmpty()) {
                 log.warn("No result returned from function to send.");
@@ -325,7 +336,7 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
         } else {
             log.info("Signaling to close...");
 
-            switch (drainMode){
+            switch (drainMode) {
                 case DRAIN:
                     log.info("Will wait for all in flight to complete before");
                     transitionToDraining();
@@ -460,7 +471,7 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
      *
      * @see #supervisorLoop(Function, Consumer)
      */
-    protected <R> void supervisorLoop(Function<ConsumerRecord<K, V>, List<R>> userFunction,
+    protected <R> void supervisorLoop(Function<List<ConsumerRecord<K, V>>, List<R>> userFunction,
                                       Consumer<R> callback) {
         if (state != State.unused) {
             throw new IllegalStateException(msg("Invalid state - the consumer cannot be used more than once (current " +
@@ -502,7 +513,7 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
     /**
      * Main control loop
      */
-    private <R> void controlLoop(Function<ConsumerRecord<K, V>, List<R>> userFunction,
+    private <R> void controlLoop(Function<List<ConsumerRecord<K, V>>, List<R>> userFunction,
                                  Consumer<R> callback) throws TimeoutException, ExecutionException {
         if (state == running) {
             log.trace("Loop: Get work");
@@ -600,6 +611,18 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
             handleFutureResult(work);
             MDC.clear();
         }
+    }
+
+    @Override
+    public void pollBatch(int specifiedBatchLevel, Consumer<List<ConsumerRecord<K, V>>> usersVoidConsumptionFunction) {
+        batchLevel = specifiedBatchLevel;
+        Function<List<ConsumerRecord<K, V>>, List<Object>> wrappedUserFunc = (recordList) -> {
+            log.trace("asyncPoll - Consumed set of records ({}), executing void function...", recordList.size());
+            usersVoidConsumptionFunction.accept(recordList);
+            return UniLists.of(); // user function returns no produce records, so we satisfy our api
+        };
+        Consumer<Object> voidCallBack = (ignore) -> log.trace("Void callback applied.");
+        supervisorLoop(wrappedUserFunc, voidCallBack);
     }
 
     /**
@@ -734,36 +757,70 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
      *
      * @param workToProcess the polled records to process
      */
-    private <R> void submitWorkToPool(Function<ConsumerRecord<K, V>, List<R>> usersFunction,
+    private <R> void submitWorkToPool(Function<List<ConsumerRecord<K, V>>, List<R>> usersFunction,
                                       Consumer<R> callback,
                                       List<WorkContainer<K, V>> workToProcess) {
 
-        for (var work : workToProcess) {
+        var batchs = makeBatchs(batchLevel, workToProcess);
+
+        for (var batch : batchs) {
             // for each record, construct dispatch to the executor and capture a Future
-            log.trace("Sending work ({}) to pool", work);
+            log.trace("Sending work ({}) to pool", batch);
             Future outputRecordFuture = workerPool.submit(() -> {
-                return userFunctionRunner(usersFunction, callback, work);
+                List<Tuple<ConsumerRecord<K, V>, R>> tuples = runUserFunction(usersFunction, callback, batch);
+                return tuples;
             });
-            work.setFuture(outputRecordFuture);
+            // for a batch, each message in the batch shares the same result
+            for (final WorkContainer<K, V> workContainer : batch) {
+                workContainer.setFuture(outputRecordFuture);
+            }
         }
+    }
+
+    private List<List<WorkContainer<K, V>>> makeBatchs(int batchLevel, List<WorkContainer<K, V>> workToProcess) {
+        return partition(workToProcess, batchLevel);
+    }
+
+    private static <T> List<List<T>> partition(Collection<T> members, int maxSize) {
+        List<List<T>> res = new ArrayList<>();
+
+        List<T> internal = new ArrayList<>();
+
+        for (T member : members) {
+            internal.add(member);
+
+            if (internal.size() == maxSize) {
+                res.add(internal);
+                internal = new ArrayList<>();
+            }
+        }
+        if (internal.isEmpty() == false) {
+            res.add(internal);
+        }
+        return res;
     }
 
     /**
      * Run the supplied function.
      */
-    protected <R> List<Tuple<ConsumerRecord<K, V>, R>> userFunctionRunner(Function<ConsumerRecord<K, V>, List<R>> usersFunction,
-                                                                          Consumer<R> callback,
-                                                                          WorkContainer<K, V> wc) {
+    protected <R> List<Tuple<ConsumerRecord<K, V>, R>> runUserFunction(Function<List<ConsumerRecord<K, V>>, List<R>> usersFunction,
+                                                                       Consumer<R> callback,
+                                                                       List<WorkContainer<K, V>> workContainerBatch) {
         // call the user's function
         List<R> resultsFromUserFunction;
         try {
-            MDC.put("offset", wc.toString());
-            log.trace("Pool received: {}", wc);
+            MDC.put("offset", workContainerBatch.toString());
+            log.trace("Pool received: {}", workContainerBatch);
 
-            ConsumerRecord<K, V> rec = wc.getCr();
-            resultsFromUserFunction = usersFunction.apply(rec);
+            List<ConsumerRecord<K, V>> records = workContainerBatch.stream().map(WorkContainer::getCr).collect(Collectors.toList());
 
-            onUserFunctionSuccess(wc, resultsFromUserFunction);
+//            List<ConsumerRecord<K, V>> records = wc.getCr();
+
+            resultsFromUserFunction = usersFunction.apply(records);
+
+            for (final WorkContainer<K, V> kvWorkContainer : workContainerBatch) {
+                onUserFunctionSuccess(kvWorkContainer, resultsFromUserFunction);
+            }
 
             // capture each result, against the input record
             var intermediateResults = new ArrayList<Tuple<ConsumerRecord<K, V>, R>>();
@@ -773,13 +830,17 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
             }
             log.trace("User function future registered");
             // fail or succeed, either way we're done
-            addToMailBoxOnUserFunctionSuccess(wc, resultsFromUserFunction);
+            for (final WorkContainer<K, V> kvWorkContainer : workContainerBatch) {
+                addToMailBoxOnUserFunctionSuccess(kvWorkContainer, resultsFromUserFunction);
+            }
             return intermediateResults;
         } catch (Exception e) {
             // handle fail
             log.debug("Error in user function", e);
-            wc.onUserFunctionFailure();
-            addToMailbox(wc); // always add on error
+            for (final WorkContainer<K, V> kvWorkContainer : workContainerBatch) {
+                kvWorkContainer.onUserFunctionFailure();
+                addToMailbox(kvWorkContainer); // always add on error
+            }
             throw e; // trow again to make the future failed
         }
     }
