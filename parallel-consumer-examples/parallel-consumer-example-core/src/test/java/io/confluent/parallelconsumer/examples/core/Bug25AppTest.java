@@ -32,35 +32,17 @@ public class Bug25AppTest extends KafkaTest<String, String> {
     @Test
     public void testTransactional() {
         boolean tx = true;
-        AppUnderTest coreApp = new AppUnderTest(tx, ParallelConsumerOptions.builder().ordering(KEY).usingTransactionalProducer(tx).build());
-
-        ensureTopic(coreApp.inputTopic, 1);
-        ensureTopic(coreApp.outputTopic, 1);
-
-        log.info("Producing 1000 messages before starting application");
-        try (Producer<String, String> kafkaProducer = kcu.createNewProducer(false)) {
-            for (int i = 0; i < 1000; i++) {
-                kafkaProducer.send(new ProducerRecord<>(coreApp.inputTopic, "key-" + i, "value-" + i));
-            }
-        }
-
-        log.info("Starting application...");
-        coreApp.runPollAndProduce();
-
-        waitAtMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-            log.info("Processed-count: " + coreApp.messagesProcessed.get());
-            log.info("Produced-count: " + coreApp.messagesProduced.get());
-            assertThat(coreApp.messagesProcessed.get()).isEqualTo(1000);
-            assertThat(coreApp.messagesProduced.get()).isEqualTo(1000);
-        });
-
-        coreApp.close();
+        runTest(tx);
     }
 
     @SneakyThrows
     @Test
     public void testNonTransactional() {
         boolean tx = false;
+        runTest(tx);
+    }
+
+    private void runTest(final boolean tx) {
         AppUnderTest coreApp = new AppUnderTest(tx, ParallelConsumerOptions.builder().ordering(KEY).usingTransactionalProducer(tx).build());
 
         ensureTopic(coreApp.inputTopic, 1);
@@ -76,7 +58,7 @@ public class Bug25AppTest extends KafkaTest<String, String> {
         log.info("Starting application...");
         coreApp.runPollAndProduce();
 
-        waitAtMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        waitAtMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             log.info("Processed-count: " + coreApp.messagesProcessed.get());
             log.info("Produced-count: " + coreApp.messagesProduced.get());
             assertThat(coreApp.messagesProcessed.get()).isEqualTo(1000);
@@ -95,8 +77,8 @@ public class Bug25AppTest extends KafkaTest<String, String> {
         @Override
         Consumer<String, String> getKafkaConsumer() {
             Properties props = kcu.props;
-//            props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1); // Sometimes causes test to fail (default 500)
-//            props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 10000);
+            props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1); // Sometimes causes test to fail (default 500)
+            props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 10000);
             return new KafkaConsumer<>(props);
         }
 
