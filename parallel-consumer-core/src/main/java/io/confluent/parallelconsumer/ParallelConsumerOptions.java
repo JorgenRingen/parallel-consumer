@@ -45,7 +45,7 @@ public class ParallelConsumerOptions {
      * // TODO we could just auto detect this from the Producers state. However, forcing it to be specified makes the choice more verbose?
      */
     @Builder.Default
-    private final boolean usingTransactionalProducer = false;
+    private final boolean usingTransactionalProducer = true;
 
     /**
      * Don't have more than this many uncommitted messages in process

@@ -1,6 +1,5 @@
 package io.confluent.parallelconsumer;
 
-import io.confluent.TransactionState;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -12,10 +11,10 @@ import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.Future;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.confluent.csid.utils.StringUtils.msg;
@@ -25,8 +24,6 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
 
     protected final Producer<K, V> producer;
     private final ParallelConsumerOptions options;
-
-    protected final TransactionState ts = new TransactionState();
 
     /**
      * The {@link KafkaProducer) isn't actually completely thread safe, at least when using it transactionally. We must
@@ -57,7 +54,6 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
                 log.debug("Initialising producer transaction session...");
                 producer.initTransactions();
                 producer.beginTransaction();
-                ts.setInTransaction();
             } catch (KafkaException e) {
                 log.error("Make sure your producer is setup for transactions - specifically make sure it's {} is set.", ProducerConfig.TRANSACTIONAL_ID_CONFIG, e);
                 throw e;
@@ -76,14 +72,19 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
      */
     @SneakyThrows
     private boolean getProducerIsTransactional(final Producer<K, V> newProducer) {
-        Field coordinatorField = newProducer.getClass().getDeclaredField("transactionManager");
-        coordinatorField.setAccessible(true);
-        TransactionManager transactionManager = (TransactionManager) coordinatorField.get(newProducer);
+        TransactionManager transactionManager = getTransactionManager(newProducer);
         if (transactionManager == null) {
             return false;
         } else {
             return transactionManager.isTransactional();
         }
+    }
+
+    private TransactionManager getTransactionManager(final Producer<K, V> newProducer) throws NoSuchFieldException, IllegalAccessException {
+        Field coordinatorField = newProducer.getClass().getDeclaredField("transactionManager");
+        coordinatorField.setAccessible(true);
+        TransactionManager transactionManager = (TransactionManager) coordinatorField.get(newProducer);
+        return transactionManager;
     }
 
     /**
@@ -152,14 +153,30 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
                     ReentrantReadWriteLock.WriteLock writeLock = producerCommitLock.writeLock();
                     writeLock.lock();
                     try {
-                        producer.commitTransaction();
+                        boolean retrying = retryCount > 0;
+                        if (retrying) {
+                            if (isTransactionCompleting()) {
+                                // try wait again
+                                producer.commitTransaction();
+                            }
+                            if (isTransactionReady()) {
+                                // tx has completed since we last tried, start a new one
+                                producer.beginTransaction();
+                            }
+                            boolean ready = (lastErrorSavedForRethrow != null) ? !lastErrorSavedForRethrow.getMessage().contains("Invalid transition attempted from state READY to state COMMITTING_TRANSACTION") : true;
+                            if (ready) {
+                                // try again
+                                log.error("Was already ready - tx completed between interrupt and retry");
+                            }
+                        } else {
+                            // happy path
+                            producer.commitTransaction();
+                            producer.beginTransaction();
+                        }
                     } finally {
                         writeLock.unlock();
                     }
-
                 }
-
-                ts.setNotInTransaction();
 
                 onOffsetCommitSuccess(offsetsToSend);
 
@@ -175,18 +192,42 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
         }
     }
 
-    @Override
-    protected void afterCommit() {
-        // begin tx for next cycle
-        producer.beginTransaction();
-        ts.setInTransaction();
+    /**
+     * TODO talk about alternatives to this brute force approach for retrying committing transactions
+     */
+    @SneakyThrows
+    private boolean isTransactionCompleting() {
+        TransactionManager transactionManager = getTransactionManager(producer);
+        Method method = transactionManager.getClass().getDeclaredMethod("isCompleting");
+        method.setAccessible(true);
+        return (boolean) method.invoke(transactionManager);
     }
 
+    /**
+     * TODO talk about alternatives to this brute force approach for retrying committing transactions
+     */
+    @SneakyThrows
+    private boolean isTransactionReady() {
+        TransactionManager transactionManager = getTransactionManager(producer);
+        Method method = transactionManager.getClass().getDeclaredMethod("isReady");
+        method.setAccessible(true);
+        return (boolean) method.invoke(transactionManager);
+    }
+
+    /**
+     * Assumes the system is drained at this point, or draining is not desired.
+     */
     public void close(final Duration timeout) {
         log.debug("Closing producer, assuming no more in flight...");
-        if (options.isUsingTransactionalProducer() && ts.isInTransaction()) {
-            // close started after tx began, but before work was done, otherwise a tx wouldn't have been started
-            producer.abortTransaction();
+        if (options.isUsingTransactionalProducer() && !isTransactionReady()) {
+            ReentrantReadWriteLock.WriteLock writeLock = producerCommitLock.writeLock();
+            writeLock.lock();
+            try {
+                // close started after tx began, but before work was done, otherwise a tx wouldn't have been started
+                producer.abortTransaction();
+            } finally {
+                writeLock.unlock();
+            }
         }
         producer.close(timeout);
     }

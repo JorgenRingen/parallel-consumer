@@ -35,12 +35,13 @@ public class ConsumerOffsetCommitter<K, V> extends AbstractOffsetCommitter<K, V>
     protected void commitOffsets(final Map<TopicPartition, OffsetAndMetadata> offsetsToSend, final ConsumerGroupMetadata groupMetadata) {
         if (isSync) {
             consumer.commitSync(offsetsToSend);
+            commitBarrier.countDown(); // todo use Condition instead?
         } else {
             consumer.commitAsync(offsetsToSend, (offsets, exception) -> {
-                if (exception == null) {
+                if (exception != null) {
                     log.error("Error committing offsets", exception);
+                    // todo keep work in limbo until async response is received?
                 }
-                commitBarrier.countDown();
             });
         }
     }

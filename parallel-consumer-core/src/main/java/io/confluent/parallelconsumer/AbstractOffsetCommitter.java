@@ -31,8 +31,6 @@ public abstract class AbstractOffsetCommitter<K, V> implements OffsetCommitter<K
             ConsumerGroupMetadata groupMetadata = consumer.groupMetadata();
 
             commitOffsets(offsetsToSend, groupMetadata);
-
-            afterCommit();
         }
     }
 
@@ -42,7 +40,4 @@ public abstract class AbstractOffsetCommitter<K, V> implements OffsetCommitter<K
 
     protected abstract void commitOffsets(final Map<TopicPartition, OffsetAndMetadata> offsetsToSend, final ConsumerGroupMetadata groupMetadata);
 
-    protected void afterCommit() {
-        // noop
-    }
 }
