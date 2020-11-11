@@ -13,6 +13,7 @@ import org.apache.kafka.common.TopicPartition;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.ConcurrentModificationException;
 import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -30,7 +31,7 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
      * be careful not to send messages to the producer, while we are committing a transaction - "Cannot call send in
      * state COMMITTING_TRANSACTION".
      */
-    private ReentrantReadWriteLock producerCommitLock;
+    private ReentrantReadWriteLock producerTransactionLock;
 
     public ProducerManager(final Producer<K, V> newProducer, final Consumer<K, V> newConsumer, final WorkManager<K, V> wm, ParallelConsumerOptions options) {
         super(newConsumer, wm);
@@ -41,11 +42,11 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
     }
 
     private void initProducer(final Producer<K, V> newProducer) {
-        producerCommitLock = new ReentrantReadWriteLock(true);
+        producerTransactionLock = new ReentrantReadWriteLock(true);
 
         boolean producerIsActuallyTransactional = getProducerIsTransactional(newProducer);
-//        String transactionIdProp = options.getProducerConfig().getProperty(ProducerConfig.TRANSACTIONAL_ID_CONFIG);
-//        boolean txIdSupplied = isBlank(transactionIdProp);
+        // String transactionIdProp = options.getProducerConfig().getProperty(ProducerConfig.TRANSACTIONAL_ID_CONFIG);
+        // boolean txIdSupplied = isBlank(transactionIdProp);
         if (options.isUsingTransactionalProducer()) {
             if (!producerIsActuallyTransactional) {
                 throw new IllegalArgumentException("Using non-transactional option, yet Producer doesn't have a transaction ID - Producer needs a transaction id");
@@ -105,7 +106,7 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
             }
         };
 
-        ReentrantReadWriteLock.ReadLock readLock = producerCommitLock.readLock();
+        ReentrantReadWriteLock.ReadLock readLock = producerTransactionLock.readLock();
         readLock.lock();
         Future<RecordMetadata> send;
         try {
@@ -120,6 +121,16 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    @Override
+    protected void postCommit() {
+        // noop
+    }
+
+    @Override
+    protected void preAcquireWork() {
+        acquireCommitLock();
     }
 
     @Override
@@ -149,33 +160,34 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
                     }
                 } else {
 
-                    // lock the producer so other threads can't send messages
-                    ReentrantReadWriteLock.WriteLock writeLock = producerCommitLock.writeLock();
-                    writeLock.lock();
-                    try {
-                        boolean retrying = retryCount > 0;
-                        if (retrying) {
-                            if (isTransactionCompleting()) {
-                                // try wait again
-                                producer.commitTransaction();
-                            }
-                            if (isTransactionReady()) {
-                                // tx has completed since we last tried, start a new one
-                                producer.beginTransaction();
-                            }
-                            boolean ready = (lastErrorSavedForRethrow != null) ? !lastErrorSavedForRethrow.getMessage().contains("Invalid transition attempted from state READY to state COMMITTING_TRANSACTION") : true;
-                            if (ready) {
-                                // try again
-                                log.error("Was already ready - tx completed between interrupt and retry");
-                            }
-                        } else {
-                            // happy path
+                    // producer commit lock should already be acquired at this point, before work was retrieved to commit,
+                    // so that more messages don't sneak into this tx block - the consumer records of which won't yet be
+                    // in this offset collection
+                    ensureLockHeld();
+
+                    boolean retrying = retryCount > 0;
+                    if (retrying) {
+                        if (isTransactionCompleting()) {
+                            // try wait again
                             producer.commitTransaction();
+                        }
+                        if (isTransactionReady()) {
+                            // tx has completed since we last tried, start a new one
                             producer.beginTransaction();
                         }
-                    } finally {
-                        writeLock.unlock();
+                        boolean ready = (lastErrorSavedForRethrow != null) ? !lastErrorSavedForRethrow.getMessage().contains("Invalid transition attempted from state READY to state COMMITTING_TRANSACTION") : true;
+                        if (ready) {
+                            // try again
+                            log.error("Was already ready - tx completed between interrupt and retry");
+                        }
+                    } else {
+                        // happy path
+                        producer.commitTransaction();
+                        producer.beginTransaction();
                     }
+                    // only release lock when commit successful
+                    // not in a finally block, because we want exceptions to cause the commit to be retried
+                    releaseCommitLock();
                 }
 
                 onOffsetCommitSuccess(offsetsToSend);
@@ -220,15 +232,33 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
     public void close(final Duration timeout) {
         log.debug("Closing producer, assuming no more in flight...");
         if (options.isUsingTransactionalProducer() && !isTransactionReady()) {
-            ReentrantReadWriteLock.WriteLock writeLock = producerCommitLock.writeLock();
-            writeLock.lock();
+            acquireCommitLock();
             try {
                 // close started after tx began, but before work was done, otherwise a tx wouldn't have been started
                 producer.abortTransaction();
             } finally {
-                writeLock.unlock();
+                releaseCommitLock();
             }
         }
         producer.close(timeout);
+    }
+
+    private void acquireCommitLock() {
+        ReentrantReadWriteLock.WriteLock writeLock = producerTransactionLock.writeLock();
+        if (producerTransactionLock.isWriteLocked() && !producerTransactionLock.isWriteLockedByCurrentThread()) {
+            log.error("held by someone else");
+            throw new ConcurrentModificationException(this.getClass().getSimpleName() + " is not safe for multi-threaded access");
+        }
+        writeLock.lock();
+    }
+
+    private void releaseCommitLock() {
+        ReentrantReadWriteLock.WriteLock writeLock = producerTransactionLock.writeLock();
+        writeLock.unlock();
+    }
+
+    private void ensureLockHeld() {
+        if (!producerTransactionLock.isWriteLockedByCurrentThread())
+            throw new IllegalStateException("Expected commit lock to be held");
     }
 }

@@ -199,7 +199,14 @@ public class ParallelEoSStreamProcessor<K, V> implements ParallelStreamProcessor
      */
     @Override
     public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-        commitOffsetsThatAreReady();
+        if (!state.equals(closing)) {
+            // only attempt to commit offsets if we're not closing. If we're clossing, we must have already maybe drained
+            // and committed offsets
+            // currently if closing and trying to commit offsets should be a noop (already done), will also cross the
+            // thread barrier as if we're running transactionally, a different thread controls the producer - and will
+            // cause a concurrent modification exception
+            commitOffsetsThatAreReady();
+        }
         wm.onPartitionsRevoked(partitions);
         usersConsumerRebalanceListener.ifPresent(x -> x.onPartitionsRevoked(partitions));
     }

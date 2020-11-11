@@ -32,6 +32,16 @@ public class ConsumerOffsetCommitter<K, V> extends AbstractOffsetCommitter<K, V>
     }
 
     @Override
+    protected void postCommit() {
+        // noop
+    }
+
+    @Override
+    protected void preAcquireWork() {
+        //noop
+    }
+
+    @Override
     protected void commitOffsets(final Map<TopicPartition, OffsetAndMetadata> offsetsToSend, final ConsumerGroupMetadata groupMetadata) {
         if (isSync) {
             consumer.commitSync(offsetsToSend);

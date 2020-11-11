@@ -56,6 +56,7 @@ public class CloseAndOpenOffsetTest extends KafkaTest<String, String> {
         rebalanceTopic = "close-and-open-" + RandomUtils.nextInt();
     }
 
+    @Timeout(value = 60)
     @SneakyThrows
     @Test
     void offsetsOpenClose() {
