@@ -487,6 +487,13 @@ your processing, you create side effects in other systems, this pertains to the 
 
 CAUTION: This cannot be true for any externally integrated third party system, unless that system is __idempotent__.
 
+You can choose to use the Transactional system, or not.
+
+Pros:
+Cons:
+
+For implementations details, see the <<Transactional System Architecture>> section.
+
 [[streams-usage]]
 == Using with Kafka Streams
 
@@ -672,6 +679,10 @@ Instead of the work thread pool count being the degree of concurrency, it is con
 
 .Vert.x Architecture
 image::https://lucid.app/publicSegments/view/509df410-5997-46be-98e7-ac7f241780b4/image.png[Vert.x Architecture, align="center"]
+
+=== Transactional System Architecture
+
+image::https://lucid.app/publicSegments/view/7480d948-ed7d-4370-a308-8ec12e6b453b/image.png[]
 
 === Offset Map
 

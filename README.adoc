@@ -313,18 +313,17 @@ Where `${project.version}` is the version to be used:
 .Setup the client
 [source,java,indent=0]
 ----
-        var options = ParallelConsumerOptions.builder()
-                .ordering(KEY) // <1>
-                .maxConcurrency(1000) // <2>
-                .maxUncommittedMessagesToHandlePerPartition(10000) // <3>
-                .build();
+        ParallelConsumerOptions options = getOptions();
 
         Consumer<String, String> kafkaConsumer = getKafkaConsumer(); // <4>
-        if (!(kafkaConsumer instanceof MockConsumer)) {
-            kafkaConsumer.subscribe(UniLists.of(inputTopic)); // <5>
-        }
+//        if (!(kafkaConsumer instanceof MockConsumer)) {
+//            kafkaConsumer.subscribe(UniLists.of(inputTopic)); // <5>
+//        }
 
-        return ParallelStreamProcessor.createEosStreamProcessor(kafkaConsumer, getKafkaProducer(), options);
+        Producer<String, String> kafkaProducer = getKafkaProducer();
+        ParallelStreamProcessor<String, String> processor = ParallelStreamProcessor.createEosStreamProcessor(kafkaConsumer, kafkaProducer, options);
+        processor.subscribe(UniLists.of(inputTopic));
+        return processor;
 ----
 <1> Choose your ordering type, `KEY` in this case.
 This ensures maximum concurrency, while ensuring messages are processed and committed in `KEY` order, making sure no offset is committed unless all offsets before it in it's partition, are completed also.
@@ -386,11 +385,15 @@ You can also optionally provide a callback function to be run after the message(
                     var result = processBrokerRecord(record);
                     ProducerRecord<String, String> produceRecord =
                             new ProducerRecord<>(outputTopic, "a-key", result.payload);
+
+                    messagesProcessed.incrementAndGet();
                     return UniLists.of(produceRecord);
-                }, consumeProduceResult ->
-                        log.info("Message {} saved to broker at offset {}",
-                                consumeProduceResult.getOut(),
-                                consumeProduceResult.getMeta().offset())
+                }, consumeProduceResult -> {
+                    messagesProduced.incrementAndGet();
+                    log.info("Message {} saved to broker at offset {}",
+                            consumeProduceResult.getOut(),
+                            consumeProduceResult.getMeta().offset());
+                }
         );
 
 
@@ -561,6 +564,13 @@ If as a part of
 your processing, you create side effects in other systems, this pertains to the usual idempotency requirements when breaking of EoS Kafka boundaries.
 
 CAUTION: This cannot be true for any externally integrated third party system, unless that system is __idempotent__.
+
+You can choose to use the Transactional system, or not.
+
+Pros:
+Cons:
+
+For implementations details, see the <<Transactional System Architecture>> section.
 
 [[streams-usage]]
 == Using with Kafka Streams
@@ -747,6 +757,10 @@ Instead of the work thread pool count being the degree of concurrency, it is con
 
 .Vert.x Architecture
 image::https://lucid.app/publicSegments/view/509df410-5997-46be-98e7-ac7f241780b4/image.png[Vert.x Architecture, align="center"]
+
+=== Transactional System Architecture
+
+image::https://lucid.app/publicSegments/view/7480d948-ed7d-4370-a308-8ec12e6b453b/image.png[]
 
 === Offset Map
 
