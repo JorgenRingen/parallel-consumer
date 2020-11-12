@@ -17,6 +17,9 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import pl.tlinkowski.unij.api.UniLists;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -27,6 +30,7 @@ import static io.confluent.parallelconsumer.ParallelConsumerOptions.ProcessingOr
  */
 @Slf4j
 public class CoreApp {
+
 
     String inputTopic = "input-topic-" + RandomUtils.nextInt();
     String outputTopic = "output-topic-" + RandomUtils.nextInt();
@@ -41,8 +45,9 @@ public class CoreApp {
 
     ParallelStreamProcessor<String, String> parallelConsumer;
 
-    public AtomicInteger messagesProcessed = new AtomicInteger(0);
-    public AtomicInteger messagesProduced = new AtomicInteger(0);
+    public List<String> processedAndProducedKeys = Collections.synchronizedList(new ArrayList<>());
+    public AtomicInteger processedCount = new AtomicInteger(0);
+    public AtomicInteger producedCount = new AtomicInteger(0);
 
     @SuppressWarnings("UnqualifiedFieldAccess")
     void run() {
@@ -93,12 +98,13 @@ public class CoreApp {
         this.parallelConsumer.pollAndProduce(record -> {
                     var result = processBrokerRecord(record);
                     ProducerRecord<String, String> produceRecord =
-                            new ProducerRecord<>(outputTopic, "a-key", result.payload);
+                            new ProducerRecord<>(outputTopic, record.key(), result.payload);
 
-                    messagesProcessed.incrementAndGet();
+                    processedCount.incrementAndGet();
                     return UniLists.of(produceRecord);
                 }, consumeProduceResult -> {
-                    messagesProduced.incrementAndGet();
+                    producedCount.incrementAndGet();
+                    processedAndProducedKeys.add(consumeProduceResult.getIn().key());
                     log.info("Message {} saved to broker at offset {}",
                             consumeProduceResult.getOut(),
                             consumeProduceResult.getMeta().offset());
