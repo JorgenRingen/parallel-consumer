@@ -78,7 +78,7 @@ public abstract class BrokerIntegrationTest<K, V> {
 
         ensureTopic(topic, numPartitions);
 
-        return name;
+        return topic;
     }
 
     protected void ensureTopic(String topic, int numPartitions) {
