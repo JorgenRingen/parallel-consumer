@@ -14,6 +14,7 @@ import org.apache.kafka.common.utils.Timer;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.time.temporal.TemporalUnit;
 import java.util.ConcurrentModificationException;
 import java.util.Map;
 import java.util.concurrent.Future;
@@ -42,7 +43,6 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
     private Field txManagerField;
     private Method txManagerMethodIsCompleting;
     private Method txManagerMethodIsReady;
-    private final long sendTimeoutSeconds = 2L;
 
     public ProducerManager(final Producer<K, V> newProducer, final ConsumerManager<K, V> newConsumer, final WorkManager<K, V> wm, ParallelConsumerOptions options) {
         super(newConsumer, wm);
@@ -138,7 +138,7 @@ public class ProducerManager<K, V> extends AbstractOffsetCommitter<K, V> impleme
         try {
             log.trace("Blocking on produce result");
             RecordMetadata recordMetadata = TimeUtils.time(() ->
-                    send.get(sendTimeoutSeconds, TimeUnit.SECONDS));
+                    send.get(options.getSendTimeout().toMillis(), TimeUnit.MILLISECONDS));
             log.trace("Produce result received");
             return recordMetadata;
         } catch (Exception e) {
